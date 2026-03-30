@@ -345,7 +345,7 @@ async function appHtml(totpKeys, ACCESS_PASSWORD) {
             <button class="icon-btn danger" onclick="remove('${name}')" title="删除">${ICONS.trash}<span class="btn-text">删除</span></button>
           </div>
         </div>
-  <div class="token">${token.slice(0, 3)} ${token.slice(3)}</div>
+  <div class="token">${token.slice(0, 3)}${token.slice(3)}</div>
   ${remark ? `<div class="remark">备注: ${escapeHtml(remark)}</div>` : ''}
         <div class="progress-bar-container"><div class="progress-bar"></div></div>
       </div>`;
@@ -404,6 +404,8 @@ body {
 .token {
   font-family: var(--code-font); font-size: 2.5rem; letter-spacing: 2px;
   font-weight: 500; text-align: center; color: var(--accent-color); margin-bottom: 1rem;
+  /* 用 ch 单位在第3位后插入视觉间距 */
+  letter-spacing: 0.1em;
 }
 .icon-btn { display: inline-flex; align-items: center; gap: 0.5rem; }
 .icon-btn .btn-text { font-size: 0.9rem; }
@@ -517,7 +519,7 @@ button:active { transform: scale(0.98); }
             if (!card) continue;
             const tokenEl = card.querySelector('.token');
             if (!tokenEl) continue;
-            if (token) tokenEl.textContent = token.slice(0,3) + ' ' + token.slice(3); else tokenEl.textContent = 'Error';
+            if (token) tokenEl.textContent = token.slice(0,3) + token.slice(3); else tokenEl.textContent = 'Error';
             if (expiry) card.setAttribute('data-expiry', expiry);
           } catch (e) { /* per-card ignore */ }
         }
@@ -561,7 +563,7 @@ button:active { transform: scale(0.98); }
   if (!card) return;
   const tokenEl = card.querySelector('.token');
   if (!tokenEl) return;
-  if (token) { tokenEl.textContent = token.slice(0,3) + ' ' + token.slice(3); } else { tokenEl.textContent = 'Error'; }
+  if (token) { tokenEl.textContent = token.slice(0,3) + token.slice(3); } else { tokenEl.textContent = 'Error'; }
   if (expiry) card.setAttribute('data-expiry', expiry);
   return;
       }
@@ -579,7 +581,7 @@ button:active { transform: scale(0.98); }
       const totp = new TOTP(secret);
       const token = await totp.generate();
       const tokenEl = card.querySelector('.token');
-      if (tokenEl) tokenEl.textContent = token.slice(0,3) + ' ' + token.slice(3);
+      if (tokenEl) tokenEl.textContent = token.slice(0,3) + token.slice(3);
     } catch (e) {
       // ignore per-card errors
     }
