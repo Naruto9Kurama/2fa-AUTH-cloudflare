@@ -39,8 +39,11 @@
     CREATE TABLE totp_keys (
       name TEXT PRIMARY KEY,
       secret TEXT NOT NULL,
-      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-    );
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      recovery_codes TEXT DEFAULT NULL,
+      remark TEXT DEFAULT NULL
+      );
+
     ```
 
 4.  **绑定数据库到 Worker**:

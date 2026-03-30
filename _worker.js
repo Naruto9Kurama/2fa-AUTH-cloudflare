@@ -56,37 +56,59 @@ async function handleRequest(request, env) {
     }
 
     // 根据 'action' 参数执行不同的数据库操作
-    switch (action) {
+    switch (action) {
       case 'add': {
-        const name = formData.get('name');
-        const secret = formData.get('secret');
-        if (name && secret) {
+        const name = formData.get('name');
+        const secret = formData.get('secret');
+        const recovery_codes = formData.get('recovery_codes') || null;
+        const remark = formData.get('remark') || null;
+        if (name && secret) {
           try {
             new TOTP(secret); // 在写入前，先在服务器端校验密钥格式的合法性
-            
-            // 将新的密钥数据插入 D1 数据库
-            await DB.prepare("INSERT INTO totp_keys (name, secret) VALUES (?, ?)")
-                    .bind(name, secret)
+
+            // 将新的密钥数据插入 D1 数据库（包含恢复码与备注）
+            await DB.prepare("INSERT INTO totp_keys (name, secret, recovery_codes, remark) VALUES (?, ?, ?, ?)")
+                    .bind(name, secret, recovery_codes, remark)
                     .run();
             return new Response('Key added successfully!', { status: 200 });
           } catch(e) {
             // 如果密钥格式错误，或名称重复（主键冲突），D1 会抛出错误
             return new Response(`添加失败: ${e.message}`, { status: 400 });
           }
-        }
-        return new Response('Missing name or secret', { status: 400 });
-      }
-      case 'delete': {
-        const keyToDelete = formData.get('key');
-        if (keyToDelete) {
+        }
+        return new Response('Missing name or secret', { status: 400 });
+      }
+      case 'delete': {
+        const keyToDelete = formData.get('key');
+        if (keyToDelete) {
           // 从 D1 数据库中删除指定的密钥
           await DB.prepare("DELETE FROM totp_keys WHERE name = ?")
                   .bind(keyToDelete)
                   .run();
-          return new Response('Key deleted successfully!', { status: 200 });
-        }
-        return new Response('Missing key to delete', { status: 400 });
-      }
+          return new Response('Key deleted successfully!', { status: 200 });
+        }
+        return new Response('Missing key to delete', { status: 400 });
+      }
+      case 'edit': {
+        // 支持重命名：前端会传 orig（原名称）和 name（新名称）
+        const orig = formData.get('orig') || formData.get('name');
+        const name = formData.get('name') || orig;
+        const secret = formData.get('secret');
+        const recovery_codes = formData.get('recovery_codes') || null;
+        const remark = formData.get('remark') || null;
+        if (!orig) return new Response('Missing original key name', { status: 400 });
+        if (!name) return new Response('Missing key name', { status: 400 });
+        if (!secret) return new Response('Missing secret', { status: 400 });
+        try {
+          new TOTP(secret);
+          await DB.prepare("UPDATE totp_keys SET name = ?, secret = ?, recovery_codes = ?, remark = ? WHERE name = ?")
+                  .bind(name, secret, recovery_codes, remark, orig)
+                  .run();
+          return new Response('Key updated successfully!', { status: 200 });
+        } catch (e) {
+          return new Response(`更新失败: ${e.message}`, { status: 400 });
+        }
+      }
       case 'auth':
         // 'auth' 操作仅用于验证密码，成功后返回200 OK，由前端进行跳转
         return new Response(null, { status: 200 });
@@ -103,17 +125,110 @@ async function handleRequest(request, env) {
     return new Response(passwordFormHtml(), { headers: noCacheHeaders });
   }
 
-  // 从D1数据库查询所有密钥以渲染主页面
-  const { results } = await DB.prepare("SELECT name, secret FROM totp_keys ORDER BY name ASC").all();
-  const totpKeys = {};
-  if (results) {
-    for (const row of results) {
-      totpKeys[row.name] = row.secret;
+  // 从D1数据库查询所有密钥以渲染主页面（包含恢复码与备注）
+  // 如果是请求获取最新 token（AJAX），返回 JSON 格式的 name->token 映射
+  // 支持两种访问方式：/?auth=true&action=tokens  或  /tokens
+  const wantsTokens = url.searchParams.get('action') === 'tokens' || url.pathname === '/tokens';
+  if (isAuthenticated && wantsTokens) {
+    // 为 JSON 响应准备无缓存头
+    const jsonNoCacheHeaders = {
+      'Content-Type': 'application/json; charset=utf-8',
+      'Cache-Control': 'no-store, no-cache, must-revalidate, max-age=0',
+      'Pragma': 'no-cache',
+      'Expires': '0'
+    };
+    try {
+      const nameParam = url.searchParams.get('name');
+      // 如果指定了 name，只返回单个 key 的 token
+      if (nameParam) {
+        const { results } = await DB.prepare("SELECT name, secret FROM totp_keys WHERE name = ? ORDER BY name ASC").bind(nameParam).all();
+        if (!results || !results[0]) return new Response(JSON.stringify({ [nameParam]: { token: null, expiry: null } }), { headers: jsonNoCacheHeaders });
+        const row = results[0];
+        try {
+          let secret = row.secret || '';
+          if (secret && secret.startsWith && secret.startsWith('otpauth://')) {
+            try { const parsed = new URL(secret); const params = new URLSearchParams(parsed.search); secret = params.get('secret') || secret; } catch (e) {}
+          }
+          if (!secret) return new Response(JSON.stringify({ [row.name]: { token: null, expiry: null } }), { headers: jsonNoCacheHeaders });
+          const t = new TOTP(secret);
+          const token = await t.generate();
+          const counter = Math.floor(Date.now() / 1000 / 30);
+          const expiryMs = (counter + 1) * 30 * 1000;
+          return new Response(JSON.stringify({ [row.name]: { token, expiry: expiryMs } }), { headers: jsonNoCacheHeaders });
+        } catch (e) {
+          return new Response(JSON.stringify({ [row.name]: { token: null, expiry: null } }), { headers: jsonNoCacheHeaders });
+        }
+      }
+
+      const { results } = await DB.prepare("SELECT name, secret FROM totp_keys ORDER BY name ASC").all();
+      const tokens = {};
+      if (results) {
+        for (const row of results) {
+          try {
+            // 支持存储为 otpauth:// URL 的情况：尝试从 URL 中取 secret 参数
+            let secret = row.secret || '';
+            if (secret && secret.startsWith && secret.startsWith('otpauth://')) {
+              try {
+                const parsed = new URL(secret);
+                const params = new URLSearchParams(parsed.search);
+                secret = params.get('secret') || secret;
+              } catch (e) {
+                // 如果解析失败，保留原始 secret 字符串，由下游处理并在出错时返回 null
+              }
+            }
+            if (!secret) { tokens[row.name] = { token: null, expiry: null }; continue; }
+            const t = new TOTP(secret);
+            const token = await t.generate();
+            const counter = Math.floor(Date.now() / 1000 / 30);
+            const expiryMs = (counter + 1) * 30 * 1000;
+            tokens[row.name] = { token, expiry: expiryMs };
+          } catch (e) {
+            // 单条记录错误不影响整体，返回 null 表示该密钥无效
+            tokens[row.name] = { token: null, expiry: null };
+          }
+        }
+      }
+      return new Response(JSON.stringify(tokens), { headers: jsonNoCacheHeaders });
+    } catch (e) {
+      console.error('tokens fetch error', e);
+      return new Response(JSON.stringify({ error: e.message || 'error' }), { status: 500, headers: jsonNoCacheHeaders });
     }
   }
 
-  // 渲染并返回包含所有密钥的主应用页面
-  return new Response(await appHtml(totpKeys, ACCESS_PASSWORD), { headers: noCacheHeaders });
+  try {
+    const { results } = await DB.prepare("SELECT name, secret, recovery_codes, remark FROM totp_keys ORDER BY name ASC").all();
+    const totpKeys = {};
+    if (results) {
+      for (const row of results) {
+        totpKeys[row.name] = { secret: row.secret, recovery_codes: row.recovery_codes, remark: row.remark };
+      }
+    }
+
+    // 渲染并返回包含所有密钥的主应用页面
+    return new Response(await appHtml(totpKeys, ACCESS_PASSWORD), { headers: noCacheHeaders });
+  } catch (e) {
+    // 捕获任何在查询或渲染过程中抛出的异常，记录并返回可读错误页面以便调试
+    console.error('Worker error:', e);
+    return new Response(errorHtml(e), { headers: noCacheHeaders, status: 500 });
+  }
+}
+
+/**
+ * 简单的 HTML 转义工具，防止注入到页面时破坏结构
+ */
+function escapeHtml(str) {
+  return String(str || '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
+function errorHtml(e) {
+  const msg = escapeHtml(e && e.message ? e.message : String(e));
+  const stack = escapeHtml(e && e.stack ? e.stack : 'no stack');
+  return `<!doctype html><html><head><meta charset="utf-8"><title>Worker Error</title><meta name="viewport" content="width=device-width,initial-scale=1"><style>body{font-family:system-ui,Segoe UI,Roboto,Arial; padding:20px;background:#fff;color:#111}pre{white-space:pre-wrap;background:#f8f8f8;padding:12px;border-radius:6px;border:1px solid #eee}</style></head><body><h2>Worker 异常</h2><p>${msg}</p><h3>Stack</h3><pre>${stack}</pre></body></html>`;
 }
 
 /**
@@ -204,20 +319,34 @@ async function appHtml(totpKeys, ACCESS_PASSWORD) {
   };
 
   let cardsHtml = '';
-  for (const name in totpKeys) {
-    const secret = totpKeys[name];
-    try {
-      const token = await new TOTP(secret).generate();
-      cardsHtml += `
-      <div class="totp-card" data-name="${name}">
+    for (const name in totpKeys) {
+  const entry = totpKeys[name] || {};
+  const secret = entry.secret || '';
+  const recovery = entry.recovery_codes || '';
+  const remark = entry.remark || '';
+  // 使用 encodeURIComponent 将任意字符（包括换行）安全编码到 data- 属性中，客户端会 decode
+  const recoveryEsc = encodeURIComponent(String(recovery || ''));
+  const remarkEsc = encodeURIComponent(String(remark || ''));
+  const secretEsc = encodeURIComponent(String(secret || ''));
+    try {
+      const token = await new TOTP(secret).generate();
+      // 计算该 token 的到期时间（毫秒级），基于当前时间与 TOTP period(30s)
+      const counter = Math.floor(Date.now() / 1000 / 30);
+      const expiryMs = (counter + 1) * 30 * 1000;
+      cardsHtml += `
+  <div class="totp-card" data-name="${name}" data-secret='${secretEsc}' data-recovery='${recoveryEsc}' data-remark='${remarkEsc}' data-expiry='${expiryMs}'>
         <div class="card-header">
           <span class="name">${name}</span>
           <div class="actions">
-            <button class="icon-btn" onclick="copy('${token}')" title="复制">${ICONS.copy}</button>
-            <button class="icon-btn danger" onclick="remove('${name}')" title="删除">${ICONS.trash}</button>
+            <button class="icon-btn" onclick="copyCurrent(this)" title="复制验证码">${ICONS.copy}<span class="btn-text">验证码</span></button>
+            <button class="icon-btn" onclick="copySecret('${name}')" title="复制密钥">${ICONS.copy}<span class="btn-text">密钥</span></button>
+            <button class="icon-btn" onclick="copyRecovery('${name}')" title="复制恢复码">${ICONS.copy}<span class="btn-text">恢复码</span></button>
+            <button class="icon-btn" onclick="openEditModal('${name}')" title="编辑">✎<span class="btn-text">编辑</span></button>
+            <button class="icon-btn danger" onclick="remove('${name}')" title="删除">${ICONS.trash}<span class="btn-text">删除</span></button>
           </div>
         </div>
-        <div class="token">${token.slice(0, 3)} ${token.slice(3)}</div>
+  <div class="token">${token.slice(0, 3)} ${token.slice(3)}</div>
+  ${remark ? `<div class="remark">备注: ${escapeHtml(remark)}</div>` : ''}
         <div class="progress-bar-container"><div class="progress-bar"></div></div>
       </div>`;
     } catch (e) {
@@ -276,6 +405,8 @@ body {
   font-family: var(--code-font); font-size: 2.5rem; letter-spacing: 2px;
   font-weight: 500; text-align: center; color: var(--accent-color); margin-bottom: 1rem;
 }
+.icon-btn { display: inline-flex; align-items: center; gap: 0.5rem; }
+.icon-btn .btn-text { font-size: 0.9rem; }
 .progress-bar-container { background-color: var(--border-color); height: 4px; border-radius: 2px; overflow: hidden; }
 .progress-bar { background-color: var(--accent-color); height: 100%; width: 100%; transition: width 1s linear; }
 .error-card { border-left: 4px solid var(--danger-color); }
@@ -307,6 +438,13 @@ button:active { transform: scale(0.98); }
   opacity: 0; transform: translateY(20px); animation: toast-in 0.5s forwards;
 }
 @keyframes toast-in { to { opacity: 1; transform: translateY(0); } }
+/* 编辑模态样式 */
+#edit-modal { position: fixed; inset: 0; display: none; z-index: 9999; }
+#edit-modal .modal-overlay { position: fixed; inset: 0; display: flex; align-items: center; justify-content: center; background: rgba(0,0,0,0.45); }
+#edit-modal .modal { background: var(--card-bg); padding: 1rem 1.25rem; border-radius: 10px; width: 94%; max-width: 520px; box-shadow: 0 8px 40px var(--shadow-color); color: var(--text-color); }
+#edit-modal .modal-body label { display: block; margin-bottom: 0.6rem; font-size: 0.95rem; }
+#edit-modal input, #edit-modal textarea { width: 100%; box-sizing: border-box; padding: 0.6rem; border-radius: 6px; border: 1px solid var(--border-color); margin-top: 4px; background: var(--bg-color); color: var(--text-color); }
+#edit-modal .modal-actions { display: flex; justify-content: flex-end; gap: 0.5rem; margin-top: 0.6rem; }
 </style>
 </head>
 <body>
@@ -315,19 +453,13 @@ button:active { transform: scale(0.98); }
     <div class="top-bar">
       <h2>验证码</h2>
       <div class="controls">
-        <button onclick="exportKeys()">导出密钥</button>
+         <!--<button onclick="exportKeys()">导出密钥</button>-->
+        <button onclick="openCreateModal()">新建</button>
         <button id="theme-toggle" class="icon-btn" title="切换主题"></button>
       </div>
     </div>
     <div class="cards-grid" id="cards-grid">${cardsHtml}</div>
-    <div class="add-section">
-      <h3>添加新密钥</h3>
-      <div class="form-group">
-        <input id="name-input" placeholder="名称 (例如: Google)">
-        <input id="secret-input" placeholder="Base32 密钥或 otpauth:// URL">
-      </div>
-      <button onclick="add()">${ICONS.plus} 添加</button>
-    </div>
+    <!-- 新建表单已移至顶部的 “新建” 按钮，使用与编辑相同的模态窗口 -->
   </div>
 
 <script>
@@ -349,6 +481,229 @@ button:active { transform: scale(0.98); }
   // 复制文本到剪贴板
   function copy(text) { navigator.clipboard.writeText(text).then(() => showToast('已复制到剪贴板')).catch(() => showToast('复制失败')); }
 
+  // 上一次使用的 TOTP 计数器，用于避免重复无意义刷新
+  let __lastTokenCounter = null;
+  // 每张卡片的上次计数器，用于按卡片触发刷新
+  const __lastTokenCounterMap = new Map();
+  // 正在刷新的卡片集合，避免重复并发请求
+  const __refreshing = new Set();
+
+  // 复制当前卡片上显示的验证码（动态生成后的值）
+  function copyCurrent(buttonEl) {
+    try {
+      const card = buttonEl.closest('.totp-card');
+      if (!card) return showToast('复制失败');
+      const tokenEl = card.querySelector('.token');
+      if (!tokenEl) return showToast('无验证码可复制');
+      const txt = (tokenEl.textContent || '').replace(/\s+/g, '');
+      if (!txt) return showToast('无验证码可复制');
+      navigator.clipboard.writeText(txt).then(() => showToast('验证码已复制')).catch(() => showToast('复制失败'));
+    } catch (e) { showToast('复制失败'); }
+  }
+
+  // 重新计算并刷新所有卡片上的验证码（用于在 modal 打开时仍能更新验证码）
+  async function refreshTokens() {
+    // 优先从服务器拉取最新 token（保持与服务器时间一致），失败则回退到本地生成
+    try {
+      const res = await fetch('/?auth=true&action=tokens');
+      if (res.ok) {
+        const map = await res.json();
+        for (const name in map) {
+          try {
+            const entry = map[name];
+            const token = entry && typeof entry === 'object' ? entry.token : entry;
+            const expiry = entry && typeof entry === 'object' ? entry.expiry : null;
+            const card = document.querySelector('.totp-card[data-name="' + name + '"]');
+            if (!card) continue;
+            const tokenEl = card.querySelector('.token');
+            if (!tokenEl) continue;
+            if (token) tokenEl.textContent = token.slice(0,3) + ' ' + token.slice(3); else tokenEl.textContent = 'Error';
+            if (expiry) card.setAttribute('data-expiry', expiry);
+          } catch (e) { /* per-card ignore */ }
+        }
+        return;
+      }
+    } catch (e) {
+      // ignore fetch errors and fall back
+    }
+
+    // 回退：本地计算 tokens
+    try {
+      const cards = Array.from(document.querySelectorAll('.totp-card'));
+      await Promise.all(cards.map(async (card) => {
+        try {
+          const secretEnc = card.getAttribute('data-secret') || '';
+          if (!secretEnc) return; // skip if no secret
+          const secret = decodeURIComponent(secretEnc);
+          const totp = new TOTP(secret);
+          const token = await totp.generate();
+          const tokenEl = card.querySelector('.token');
+          if (tokenEl) tokenEl.textContent = token.slice(0,3) + ' ' + token.slice(3);
+        } catch (e) {
+          // ignore per-card errors
+        }
+      }));
+    } catch (e) {
+      // swallow errors to avoid interrupting timer
+    }
+  }
+
+  // 刷新单个卡片的 token（优先使用服务器接口，失败则本地生成）
+  async function refreshTokenFor(name) {
+    try {
+      const res = await fetch('/?auth=true&action=tokens&name=' + encodeURIComponent(name));
+      if (res.ok) {
+  const map = await res.json();
+  const entry = map && map[name];
+  const token = entry && typeof entry === 'object' ? entry.token : entry;
+  const expiry = entry && typeof entry === 'object' ? entry.expiry : null;
+  const card = document.querySelector('.totp-card[data-name="' + name + '"]');
+  if (!card) return;
+  const tokenEl = card.querySelector('.token');
+  if (!tokenEl) return;
+  if (token) { tokenEl.textContent = token.slice(0,3) + ' ' + token.slice(3); } else { tokenEl.textContent = 'Error'; }
+  if (expiry) card.setAttribute('data-expiry', expiry);
+  return;
+      }
+    } catch (e) {
+      // ignore and fall back
+    }
+
+    // 回退：本地计算单个 token
+    try {
+      const card = document.querySelector('.totp-card[data-name="' + name + '"]');
+      if (!card) return;
+      const secretEnc = card.getAttribute('data-secret') || '';
+      if (!secretEnc) return;
+      const secret = decodeURIComponent(secretEnc);
+      const totp = new TOTP(secret);
+      const token = await totp.generate();
+      const tokenEl = card.querySelector('.token');
+      if (tokenEl) tokenEl.textContent = token.slice(0,3) + ' ' + token.slice(3);
+    } catch (e) {
+      // ignore per-card errors
+    }
+  }
+
+  // 复制恢复码（从卡片的 data-recovery 属性读取）
+  function copyRecovery(name) {
+    try {
+      const card = document.querySelector('.totp-card[data-name="' + name + '"]');
+      const codesEnc = card ? card.getAttribute('data-recovery') || '' : '';
+      if (!codesEnc) { showToast('无恢复码'); return; }
+      const codes = decodeURIComponent(codesEnc);
+      navigator.clipboard.writeText(codes).then(() => showToast('恢复码已复制')).catch(() => showToast('复制失败'));
+    } catch (e) { showToast('复制失败'); }
+  }
+
+  // 复制密钥（从卡片的 data-secret 属性读取）
+  function copySecret(name) {
+    try {
+      const card = document.querySelector('.totp-card[data-name="' + name + '"]');
+      const secretEnc = card ? card.getAttribute('data-secret') || '' : '';
+      if (!secretEnc) { showToast('无密钥可复制'); return; }
+      const secret = decodeURIComponent(secretEnc);
+      navigator.clipboard.writeText(secret).then(() => showToast('密钥已复制')).catch(() => showToast('复制失败'));
+    } catch (e) { showToast('复制失败'); }
+  }
+
+  // 创建并注入编辑模态（只创建一次），并提供 openEditModal/orig 保存逻辑
+  (function setupEditModal(){
+    if (document.getElementById('edit-modal')) return;
+    const overlay = document.createElement('div');
+    overlay.id = 'edit-modal';
+    overlay.style.display = 'none';
+    overlay.innerHTML = \`
+      <div class="modal-overlay">
+        <div class="modal">
+          <h3 id="modal-title">编辑密钥</h3>
+          <div class="modal-body">
+            <label>名称<br><input id="modal-name" type="text"></label>
+            <label>密钥 (Base32 或 otpauth:// URL)<br><input id="modal-secret" type="text"></label>
+            <label>恢复码（支持多行）<br><textarea id="modal-recovery" rows="4"></textarea></label>
+            <label>备注<br><textarea id="modal-remark" rows="2"></textarea></label>
+          </div>
+          <div class="modal-actions">
+            <button id="modal-cancel">取消</button>
+            <button id="modal-save">保存</button>
+          </div>
+        </div>
+      </div>\`;
+    document.addEventListener('DOMContentLoaded', () => document.body.appendChild(overlay));
+    // attach handlers after appended
+    function onSave() {
+      const mode = overlay.getAttribute('data-mode') || 'edit';
+      const orig = overlay.getAttribute('data-orig');
+      const name = document.getElementById('modal-name').value.trim();
+      let secret = document.getElementById('modal-secret').value.trim();
+      const recovery = document.getElementById('modal-recovery').value;
+      const remark = document.getElementById('modal-remark').value;
+      if (!name || !secret) { showToast('名称和密钥不能为空'); return; }
+      if (secret.startsWith('otpauth://')) {
+        try { const parsed = new URL(secret); const params = new URLSearchParams(parsed.search); secret = params.get('secret') || secret; } catch(e){}
+      }
+      // choose action based on mode
+      if (mode === 'create') {
+        fetch('/', {
+          method: 'POST', headers: {'Content-Type':'application/x-www-form-urlencoded'},
+          body: 'password=' + encodeURIComponent(PWD) + '&action=add&name=' + encodeURIComponent(name) + '&secret=' + encodeURIComponent(secret) + '&recovery_codes=' + encodeURIComponent(recovery) + '&remark=' + encodeURIComponent(remark)
+        }).then(async res => {
+          if (res.ok) { showToast('创建成功'); closeModal(); location.reload(); } else { showToast('创建失败: ' + await res.text()); }
+        }).catch(()=> showToast('创建失败'));
+      } else {
+        fetch('/', {
+          method: 'POST', headers: {'Content-Type':'application/x-www-form-urlencoded'},
+          body: 'password=' + encodeURIComponent(PWD) + '&action=edit&orig=' + encodeURIComponent(orig) + '&name=' + encodeURIComponent(name) + '&secret=' + encodeURIComponent(secret) + '&recovery_codes=' + encodeURIComponent(recovery) + '&remark=' + encodeURIComponent(remark)
+        }).then(async res => {
+          if (res.ok) { showToast('更新成功'); closeModal(); location.reload(); } else { showToast('更新失败: ' + await res.text()); }
+        }).catch(()=> showToast('更新失败'));
+      }
+    }
+    function closeModal(){ overlay.style.display = 'none'; }
+    function openModalFor(mode, orig, name, secret, recovery, remark){
+      overlay.setAttribute('data-mode', mode || 'edit');
+      overlay.setAttribute('data-orig', orig || '');
+      document.getElementById('modal-name').value = name || orig || '';
+      document.getElementById('modal-secret').value = secret || '';
+      document.getElementById('modal-recovery').value = recovery || '';
+      document.getElementById('modal-remark').value = remark || '';
+      // update title and save button text
+      const titleEl = document.getElementById('modal-title');
+      const saveBtn = document.getElementById('modal-save');
+      if (mode === 'create') { titleEl.textContent = '新建密钥'; saveBtn.textContent = '创建'; } else { titleEl.textContent = '编辑密钥'; saveBtn.textContent = '保存'; }
+      overlay.style.display = 'block';
+    }
+    // attach once DOM ready
+    document.addEventListener('DOMContentLoaded', () => {
+      const root = document.getElementById('edit-modal');
+      const btnCancel = root.querySelector('#modal-cancel');
+      const btnSave = root.querySelector('#modal-save');
+      btnCancel.addEventListener('click', () => { root.style.display = 'none'; });
+      btnSave.addEventListener('click', onSave);
+      // close on overlay click
+      root.querySelector('.modal-overlay').addEventListener('click', (e)=>{ if (e.target === root.querySelector('.modal-overlay')) root.style.display = 'none'; });
+    });
+    // expose openEditModal and openCreateModal globally
+    window.openEditModal = function(origName){
+      const card = document.querySelector('.totp-card[data-name="' + origName + '"]');
+      const secretEnc = card ? card.getAttribute('data-secret') || '' : '';
+      const recoveryEnc = card ? card.getAttribute('data-recovery') || '' : '';
+      const remarkEnc = card ? card.getAttribute('data-remark') || '' : '';
+      const secret = secretEnc ? decodeURIComponent(secretEnc) : '';
+      const recovery = recoveryEnc ? decodeURIComponent(recoveryEnc) : '';
+      const remark = remarkEnc ? decodeURIComponent(remarkEnc) : '';
+      // ensure modal appended
+      const overlayEl = document.getElementById('edit-modal');
+      if (!overlayEl) { document.body.appendChild(overlay); }
+      openModalFor('edit', origName, origName, secret, recovery, remark);
+    };
+    window.openCreateModal = function(){
+      const overlayEl = document.getElementById('edit-modal');
+      if (!overlayEl) { document.body.appendChild(overlay); }
+      openModalFor('create', '', '', '', '', '');
+    };
+  })();
+
   /* --- 核心数据操作函数 --- */
 
   /**
@@ -356,49 +711,19 @@ button:active { transform: scale(0.98); }
    * 它会向服务器发送一个 'add' 请求，并在成功后立即刷新页面。
    * 由于后端使用 D1 数据库，数据是强一致性的，因此可以立即刷新。
    */
-  async function add() {
-    const nameInput = document.getElementById('name-input');
-    const secretInput = document.getElementById('secret-input');
-    let name = nameInput.value.trim();
-    let secret = secretInput.value.trim();
-
-    if (secret.startsWith('otpauth://')) {
-      try {
-        const parsed = new URL(secret);
-        const params = new URLSearchParams(parsed.search);
-        secret = params.get('secret');
-        if (!name) {
-           name = decodeURIComponent(parsed.pathname.split('/').pop().split(':').pop()) || params.get('issuer') || '未命名';
-        }
-      } catch (e) { showToast('无效的 otpauth URL'); return; }
-    }
-    if (!name || !secret) { showToast('请填写名称和密钥'); return; }
-
-    const res = await fetch('/', {
-      method: 'POST',
-      headers: {'Content-Type': 'application/x-www-form-urlencoded'},
-      body: \`password=\${encodeURIComponent(PWD)}&action=add&name=\${encodeURIComponent(name)}&secret=\${encodeURIComponent(secret)}\`
-    });
-
-    if (res.ok) {
-      showToast('添加成功！');
-      location.reload(); 
-    } else {
-      showToast(\`添加失败: \${await res.text()}\`);
-    }
-  }
+  // 新建表单行为由 modal 处理（openCreateModal -> modal 保存时触发 add）
 
   /**
    * 处理删除密钥的逻辑。
    * 它会向服务器发送一个 'delete' 请求，并在成功后立即刷新页面。
    */
   async function remove(name) {
-    if (!confirm(\`确定要删除 "\${name}" 吗？\`)) return;
+  if (!confirm('确定要删除 "' + name + '" 吗？')) return;
 
     const res = await fetch('/', {
       method: 'POST',
       headers: {'Content-Type': 'application/x-www-form-urlencoded'},
-      body: \`password=\${encodeURIComponent(PWD)}&action=delete&key=\${encodeURIComponent(name)}\`
+      body: 'password=' + encodeURIComponent(PWD) + '&action=delete&key=' + encodeURIComponent(name)
     });
 
     if (res.ok) {
@@ -419,16 +744,20 @@ button:active { transform: scale(0.98); }
    * 每秒更新所有验证码卡片的倒计时进度条。
    * 并在每个30秒周期的开始点触发页面刷新。
    */
-  function updateTimer() { 
-    const seconds = new Date().getSeconds(); 
-    if (seconds % 30 === 0) { 
-      if (timerInterval) clearInterval(timerInterval); 
-      setTimeout(() => location.reload(), 500); // 延迟一小会确保服务器时间也已同步
-      return; 
-    } 
-    const remaining = 30 - (seconds % 30); 
-    const percentage = (remaining / 30) * 100; 
-    document.querySelectorAll('.progress-bar').forEach(bar => { bar.style.width = percentage + '%'; }); 
+  async function updateTimer() {
+    const seconds = new Date().getSeconds();
+    const remaining = 30 - (seconds % 30);
+    const percentage = (remaining / 30) * 100;
+    // 使用全局计时器同步更新所有卡片的进度条
+    document.querySelectorAll('.progress-bar').forEach(bar => { bar.style.width = percentage + '%'; });
+
+    // 在每个30s周期边界（当计数器变化时）统一调用 refreshTokens()，而不刷新页面
+    const currentCounter = Math.floor(Date.now() / 1000 / 30);
+    if (currentCounter !== __lastTokenCounter) {
+      __lastTokenCounter = currentCounter;
+      // 延迟少许以避开边界微差，并防抖一次性刷新所有 token
+      setTimeout(() => { refreshTokens(); }, 200);
+    }
   }
   
   // 页面加载完成后立即启动定时器
