@@ -1,3 +1,4 @@
+在ggzhzc/2fa-AUTH-cloudflare基础上优化了页面效果、增加输入恢复码、备注、复制密钥等功能
 # Cloudflare TOTP 网页验证器部署指南
 
 这是一个部署在 Cloudflare Workers 上的网页应用，它能像 Google Authenticator 或其他验证器应用一样，安全地存储和显示基于时间的一次性密码（TOTP）。
