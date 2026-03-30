@@ -335,20 +335,22 @@ async function appHtml(totpKeys, ACCESS_PASSWORD) {
       const expiryMs = (counter + 1) * 30 * 1000;
       cardsHtml += `
   <div class="totp-card" data-name="${name}" data-secret='${secretEsc}' data-recovery='${recoveryEsc}' data-remark='${remarkEsc}' data-expiry='${expiryMs}'>
-        <div class="card-header">
-          <span class="name">${name}</span>
-          <div class="actions">
-            <button class="icon-btn" onclick="copyCurrent(this)" title="复制验证码">${ICONS.copy}<span class="btn-text">验证码</span></button>
-            <button class="icon-btn" onclick="copySecret('${name}')" title="复制密钥">${ICONS.copy}<span class="btn-text">密钥</span></button>
-            <button class="icon-btn" onclick="copyRecovery('${name}')" title="复制恢复码">${ICONS.copy}<span class="btn-text">恢复码</span></button>
-            <button class="icon-btn" onclick="openEditModal('${name}')" title="编辑">✎<span class="btn-text">编辑</span></button>
-            <button class="icon-btn danger" onclick="remove('${name}')" title="删除">${ICONS.trash}<span class="btn-text">删除</span></button>
-          </div>
-        </div>
-  <div class="token">${token.slice(0, 3)}${token.slice(3)}</div>
-  ${remark ? `<div class="remark">备注: ${escapeHtml(remark)}</div>` : ''}
-        <div class="progress-bar-container"><div class="progress-bar"></div></div>
-      </div>`;
+    <div class="card-header">
+      <span class="name">${name}</span>
+      <div class="actions">
+        <button class="icon-btn" onclick="openEditModal('${name}')" title="编辑">✎<span class="btn-text">编辑</span></button>
+        <button class="icon-btn danger" onclick="remove('${name}')" title="删除">${ICONS.trash}<span class="btn-text">删除</span></button>
+      </div>
+    </div>
+    <div class="token">${token.slice(0, 3)+token.slice(3)}</div>
+    ${remark ? `<div class="remark">备注: ${escapeHtml(remark)}</div>` : ''}
+    <div class="copy-actions">
+      <button class="icon-btn" onclick="copyCurrent(this)" title="复制验证码">${ICONS.copy}<span class="btn-text">验证码</span></button>
+      <button class="icon-btn" onclick="copySecret('${name}')" title="复制密钥">${ICONS.copy}<span class="btn-text">密钥</span></button>
+      <button class="icon-btn" onclick="copyRecovery('${name}')" title="复制恢复码">${ICONS.copy}<span class="btn-text">恢复码</span></button>
+    </div>
+    <div class="progress-bar-container"><div class="progress-bar"></div></div>
+  </div>`;
     } catch (e) {
       cardsHtml += `
       <div class="totp-card error-card" data-name="${name}">
@@ -407,6 +409,12 @@ body {
   /* 用 ch 单位在第3位后插入视觉间距 */
   letter-spacing: 0.1em;
 }
+.copy-actions {
+  display: flex;
+  gap: 8px;
+  padding: 4px 0;
+}
+
 .icon-btn { display: inline-flex; align-items: center; gap: 0.5rem; }
 .icon-btn .btn-text { font-size: 0.9rem; }
 .progress-bar-container { background-color: var(--border-color); height: 4px; border-radius: 2px; overflow: hidden; }
